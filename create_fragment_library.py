@@ -9,7 +9,6 @@ import time
 import math
 from collections import Counter
 
-
 # import dependencies
 import pandas as pd
 import numpy as np
@@ -1710,14 +1709,12 @@ def run_overlap_extension_clash_detection(data:pd.DataFrame, directory:str, radi
     def write_extension_overlap_cmd(script_path, fragments_a_path, fragments_b_path, radius, cylinder_height, out_path):
         return f"{os.path.join(PROTFLOW_ENV, 'python')} {script_path} --frags1 {fragments_a_path} --frags2 {fragments_b_path} --radius {radius} --cylinder_height {cylinder_height} --out {out_path}"
 
-    from itertools import combinations
-
     def build_pair_ids(df, pose_col='poses', model_col='model_num'):
         recs = []
         for ens, g in df.groupby('ensemble_num', sort=False):
             members = list(zip(g[pose_col], g[model_col]))
-            for a, b in combinations(members, 2):
-                lo, hi = (a, b) if a <= b else (b, a)
+            for a, b in itertools.combinations(members, 2):
+                lo, hi = (a, b) if a <= b else (b, a) # to canonicalize
                 recs.append({'ensemble_num': ens, 'id': (lo[0], lo[1], hi[0], hi[1])})
         return pd.DataFrame(recs)
     
@@ -1741,19 +1738,12 @@ def run_overlap_extension_clash_detection(data:pd.DataFrame, directory:str, radi
     for out_path in out_paths:
         results.append(pd.read_pickle(out_path))
 
-    log_and_print("start ids")
+    results = pd.concat(results)
     id_df = build_pair_ids(data)
 
-    results = pd.concat(results)
 
-    log_and_print("merge")
     results = results.merge(id_df, on="id")
-    results.to_csv("out1.csv")
-
-    log_and_print("group")
-
     results = results[["ensemble_num", "overlap"]].groupby("ensemble_num", sort=False).sum(numeric_only=True)
-    log_and_print("done")
 
     results.to_csv("out2.csv")
     return results
@@ -2150,13 +2140,8 @@ def main(args):
 
     score_df = normalize_col(score_df, 'fragment_score')
     score_df = normalize_col(score_df, 'overlap')
-    log_and_print(score_df["overlap"])
-    log_and_print(score_df["overlap_normalized"])
-    log_and_print(score_df["fragment_score"])
-    log_and_print(score_df["fragment_score_normalized"])
 
-
-    score_df = combine_normalized_scores(score_df, 'ensemble_score', ['fragment_score_normalized', 'overlap_normalized'], [1, -1], False, True)
+    score_df = combine_normalized_scores(score_df, 'ensemble_score', ['fragment_score_normalized', 'overlap_normalized'], [args.fragment_score_weight, args.overlap_weight], False, True)
 
     log_and_print(f'Found {len(score_df.index)} non-clashing ensembles.')
     log_and_print(score_df["ensemble_score"])
@@ -2259,12 +2244,13 @@ def main(args):
                  'backbone_probability': [("backbone_probability", concat_columns), ("backbone_probability_mean", "mean")],
                  'rotamer_probability': [("rotamer_probability", concat_columns), ("rotamer_probability_mean", "mean")],
                  'phi_psi_occurrence': [("phi_psi_occurrence", concat_columns), ("phi_psi_occurrence_mean", "mean")],
-                 'covalent_bonds': concat_columns}
+                 'covalent_bonds': concat_columns,
+                 'overlap': 'mean'}
 
     selected_paths = selected_paths.groupby('path_name', sort=False).agg(aggregate).reset_index(names=["path_name"])
     selected_paths.columns = ['path_name', 'poses', 'chain_id', 'model_num', 'rotamer_pos', 'frag_length',
                                'path_score', 'backbone_probability', 'backbone_probability_mean', 'rotamer_probability',
-                               'rotamer_probability_mean','phi_psi_occurrence', 'phi_psi_occurrence_mean', 'covalent_bonds']
+                               'rotamer_probability_mean','phi_psi_occurrence', 'phi_psi_occurrence_mean', 'covalent_bonds', 'overlap']
 
     # create residue selections
     selected_paths["fixed_residues"] = selected_paths.apply(lambda row: split_str_to_dict(row['chain_id'], row['rotamer_pos'], sep=","), axis=1)
@@ -2319,7 +2305,7 @@ def main(args):
     # write output json
     selected_paths.to_json(out_json)
 
-    violinplot_multiple_cols(selected_paths, cols=['backbone_probability_mean', 'phi_psi_occurrence_mean', 'rotamer_probability_mean'], titles=['mean backbone\nprobability', 'mean phi/psi\nprobability', 'mean rotamer\nprobability'], y_labels=['probability', 'probability', 'probability'], out_path=os.path.join(working_dir, "selected_paths_info.png"), show_fig=False)
+    violinplot_multiple_cols(selected_paths, cols=['overlap', 'backbone_probability_mean', 'phi_psi_occurrence_mean', 'rotamer_probability_mean'], titles=['overlap', 'mean backbone\nprobability', 'mean phi/psi\nprobability', 'mean rotamer\nprobability'], y_labels=['relative\ncylinder overlap', 'probability', 'probability', 'probability'], out_path=os.path.join(working_dir, "selected_paths_info.png"), show_fig=False)
 
     log_and_print('Done!')
 
@@ -2377,13 +2363,13 @@ if __name__ == "__main__":
     argparser.add_argument("--backbone_score_weight", type=float, default=1, help="Weight for importance of fragment backbone score (boltzman score of number of occurrences of similar fragments in the database) when sorting fragments.")
     argparser.add_argument("--rotamer_score_weight", type=float, default=1, help="Weight for importance of rotamer score (combined score of probability and occurrence) when sorting fragments.")
     argparser.add_argument("--chi_std_multiplier", type=float, default=2, help="Multiplier for chi angle standard deviation to check if rotamer in database fits to desired rotamer.")
-
+    argparser.add_argument("--fragment_score_weight", type=float, default=1, help="Weight for importance of fragment score.")
+    argparser.add_argument("--overlap_weight", type=float, default=-1, help="Weight for importance of cylindrical overlap.")
 
     # stuff you might want to adjust
     argparser.add_argument("--max_paths_per_ensemble", type=int, default=4, help="Maximum number of paths per ensemble (=same fragments but in different order)")
     argparser.add_argument("--frag_frag_bb_clash_vdw_multiplier", type=float, default=0.9, help="Multiplier for VanderWaals radii for clash detection inbetween backbone fragments. Clash is detected if distance_between_atoms < (VdW_radius_atom1 + VdW_radius_atom2)*multiplier.")
     argparser.add_argument("--frag_frag_sc_clash_vdw_multiplier", type=float, default=0.8, help="Multiplier for VanderWaals radii for clash detection between fragment sidechains and backbones. Clash is detected if distance_between_atoms < (VdW_radius_atom1 + VdW_radius_atom2)*multiplier.")
-    argparser.add_argument("--fragment_score_weight", type=float, default=1, help="Maximum number of cpus to run on")
     argparser.add_argument("--max_top_out", type=int, default=100, help="Maximum number of top-ranked output paths")
     argparser.add_argument("--max_random_out", type=int, default=100, help="Maximum number of random-ranked output paths")
 
