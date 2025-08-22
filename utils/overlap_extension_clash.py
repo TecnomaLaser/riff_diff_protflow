@@ -33,6 +33,76 @@ def fit_line_pca(points):
     
     return c, v, (s_min, s_max), r_est         # return centroid, direction, span, and estimated radius
 
+def fit_line_helix_centroids(points, window=4, trim_ends=0, outlier_z=2.5):
+    """
+    Helix-aware axis fit using sliding-window centroids (e.g., i..i+3 Cα).
+    Returns:
+      c : centroid on axis
+      v : unit direction vector (N→C oriented)
+      (s_min, s_max) : projection range of the ORIGINAL points along v
+      r_est : RMS radial distance of ORIGINAL points to axis
+    Args:
+      points     : (N,3) array (ideally Cα atoms ordered from N to C)
+      window     : sliding window length for centroids (4 is classic for α-helix)
+      trim_ends  : optional number of residues to drop from each end before centroiding
+      outlier_z  : remove centroid outliers farther than z * MAD from preliminary line
+    """
+    P = np.asarray(points, dtype=float)
+    if P.ndim != 2 or P.shape[1] != 3 or P.shape[0] < max(5, window+1):
+        # fallback to your PCA if not enough points
+        return fit_line_pca(P)
+
+    # 0) optionally trim ragged ends before centroiding
+    if trim_ends > 0:
+        P_used = P[trim_ends: -trim_ends]
+        if P_used.shape[0] < window+1:
+            P_used = P  # not enough points to trim
+    else:
+        P_used = P
+
+    # 1) sliding-window centroids (i..i+window-1)
+    M = P_used.shape[0] - window + 1
+    C = np.empty((M, 3), dtype=float)
+    for i in range(M):
+        C[i] = P_used[i:i+window].mean(axis=0)
+
+    # 2) preliminary line from centroids via PCA
+    Cc = C - C.mean(axis=0)
+    _, _, Vt = np.linalg.svd(Cc, full_matrices=False)
+    v0 = Vt[0]; v0 /= np.linalg.norm(v0)
+    c0 = C.mean(axis=0)
+
+    # 3) robust pass: remove centroid outliers (radial distance from preliminary line)
+    #    distance to line through c0 with direction v0
+    t = (C - c0) @ v0
+    C_proj = c0 + np.outer(t, v0)
+    resid = np.linalg.norm(C - C_proj, axis=1)
+    med = np.median(resid)
+    mad = np.median(np.abs(resid - med)) + 1e-9  # robust scale
+    keep = resid <= (med + outlier_z * 1.4826 * mad)  # 1.4826 ≈ MAD→σ for Gauss
+
+    if keep.sum() >= max(3, window):  # refit if we actually kept enough points
+        Ck = C[keep]
+        Ckc = Ck - Ck.mean(axis=0)
+        _, _, Vt2 = np.linalg.svd(Ckc, full_matrices=False)
+        v = Vt2[0]; v /= np.linalg.norm(v)
+        c = Ck.mean(axis=0)
+    else:
+        v, c = v0, c0
+
+    # 4) Orient axis N→C using original endpoints
+    if ((P[-1] - P[0]) @ v) < 0:
+        v = -v
+
+    # 5) Project ORIGINAL points to get span and radius estimate
+    X = P - c
+    s_vals = X @ v
+    s_min, s_max = float(s_vals.min()), float(s_vals.max())
+    perp = X - np.outer(s_vals, v)
+    r_est = float(np.sqrt((perp**2).sum(axis=1).mean()))
+
+    return c, v, (s_min, s_max), r_est
+
 
 def point_in_capped_cylinder(P, A, B, r):
     """
@@ -161,7 +231,8 @@ def create_cylinder_xyz(
 
 def extension_overlap_fraction(
     pts1, pts2,
-    ext_A=5.0,
+    ext_1=5.0,
+    ext_2=5.0,
     radius1=None, radius2=None,
     estimate_radius_from_points=False,
     dx=0.5,
@@ -171,31 +242,46 @@ def extension_overlap_fraction(
     xyz_surface_include_caps=True,
     xyz_elem1="C", xyz_elem2="N"
 ):
-    # assumes you already have: fit_line_pca, segment_endpoints_from_axis,
-    # point_in_capped_cylinder, bbox_for_segments
+    """
+    Returns a dict with overlap metrics + multiple terminal/endpoint distances.
+    Assumes pts1/pts2 are ordered N -> C (as used by fit_line_helix_centroids).
+    Requires: fit_line_helix_centroids, segment_endpoints_from_axis,
+              point_in_capped_cylinder, bbox_for_segments, create_cylinder_xyz.
+    """
+    pts1 = np.asarray(pts1, dtype=float)
+    pts2 = np.asarray(pts2, dtype=float)
 
-    # 1) fit axes
-    c1, v1, (s1_min, s1_max), r1_est = fit_line_pca(pts1)
-    c2, v2, (s2_min, s2_max), r2_est = fit_line_pca(pts2)
+    # 1) Fit axes (helix-aware; oriented N->C)
+    c1, v1, (s1_min, s1_max), r1_est = fit_line_helix_centroids(pts1)
+    c2, v2, (s2_min, s2_max), r2_est = fit_line_helix_centroids(pts2)
 
-    # 2) radii
+    # 2) Radii
     r1 = (r1_est if (estimate_radius_from_points or radius1 is None) else float(radius1))
     r2 = (r2_est if (estimate_radius_from_points or radius2 is None) else float(radius2))
 
-    # 3) extension segments
-    segs1 = [
-        segment_endpoints_from_axis(c1, v1, s1_min - ext_A, s1_min),
-        segment_endpoints_from_axis(c1, v1, s1_max, s1_max + ext_A),
-    ]
-    segs2 = [
-        segment_endpoints_from_axis(c2, v2, s2_min - ext_A, s2_min),
-        segment_endpoints_from_axis(c2, v2, s2_max, s2_max + ext_A),
-    ]
+    # 3) Single full-span segments with overhangs
+    segs1 = [segment_endpoints_from_axis(c1, v1, s1_min - ext_1, s1_max + ext_1)]
+    segs2 = [segment_endpoints_from_axis(c2, v2, s2_min - ext_2, s2_max + ext_2)]
 
-    # 4) total volume (sum of four cylinders)
-    V_total = np.pi * r1**2 * (2*ext_A) + np.pi * r2**2 * (2*ext_A)
+    # -- Useful axis points (native and extended) for distances
+    N1_axis = c1 + s1_min * v1
+    C1_axis = c1 + s1_max * v1
+    N2_axis = c2 + s2_min * v2
+    C2_axis = c2 + s2_max * v2
 
-    # 5) voxel overlap estimate
+    N1_ext_axis = c1 + (s1_min - ext_1) * v1
+    C1_ext_axis = c1 + (s1_max + ext_1) * v1
+    N2_ext_axis = c2 + (s2_min - ext_2) * v2
+    C2_ext_axis = c2 + (s2_max + ext_2) * v2
+
+    # 4) Analytic volumes of the two single cylinders
+    h1 = (s1_max - s1_min) + (ext_1 * 2.0)
+    h2 = (s2_max - s2_min) + (ext_2 * 2.0)
+    V1 = np.pi * (r1**2) * h1
+    V2 = np.pi * (r2**2) * h2
+    V_total = V1 + V2
+
+    # 5) Voxel overlap estimate
     lo, hi = bbox_for_segments(segs1 + segs2, pad=max(r1, r2) + dx)
     xs = np.arange(lo[0], hi[0] + dx/2, dx)
     ys = np.arange(lo[1], hi[1] + dx/2, dx)
@@ -203,18 +289,13 @@ def extension_overlap_fraction(
     X, Y, Z = np.meshgrid(xs, ys, zs, indexing='xy')
     P = np.column_stack([X.ravel(), Y.ravel(), Z.ravel()])
 
-    in_ext1 = np.zeros(P.shape[0], dtype=bool)
-    for (A, B) in segs1:
-        in_ext1 |= point_in_capped_cylinder(P, A, B, r1)
+    in_1 = point_in_capped_cylinder(P, segs1[0][0], segs1[0][1], r1)
+    in_2 = point_in_capped_cylinder(P, segs2[0][0], segs2[0][1], r2)
+    V_overlap = (in_1 & in_2).sum() * (dx**3)
+    frac_sum = 0.0 if V_total == 0 else float(V_overlap / V_total)
 
-    in_ext2 = np.zeros(P.shape[0], dtype=bool)
-    for (A, B) in segs2:
-        in_ext2 |= point_in_capped_cylinder(P, A, B, r2)
 
-    V_overlap = (in_ext1 & in_ext2).sum() * (dx**3)
-    frac = 0.0 if V_total == 0 else float(V_overlap / V_total)
-
-    # 6) one-liner XYZ surface export (your style)
+    # 6) Surface XYZ export (single cylinders per helix)
     if xyz_surface_path is not None:
         create_cylinder_xyz(
             xyz_surface_path,
@@ -225,7 +306,35 @@ def extension_overlap_fraction(
             element1=xyz_elem1, element2=xyz_elem2
         )
 
-    return frac
+    # 7) Distances
+    #   a) atomistic termini (first/last coordinates provided)
+    d_N_C_terms_atoms = float(np.linalg.norm(pts1[0] - pts2[-1]))
+    d_C_N_terms_atoms = float(np.linalg.norm(pts1[-1] - pts2[0]))
+
+    #   b) axis points at native termini
+    d_N_C_axis = float(np.linalg.norm(N1_axis - C2_axis))
+    d_C_N_axis = float(np.linalg.norm(C1_axis - N2_axis))
+
+    #   c) axis points at extended cylinder endpoints
+    d_N_C_ext_axis = float(np.linalg.norm(N1_ext_axis - C2_ext_axis))
+    d_C_N_ext_axis = float(np.linalg.norm(C1_ext_axis - N2_ext_axis))
+
+    return {
+        # overlap metrics
+        "overlap": frac_sum,         # V_intersection / (V1 + V2)
+
+        # distances: termini atoms (as given)
+        "d_N_C_terms": d_N_C_terms_atoms,
+        "d_C_N_terms": d_C_N_terms_atoms,
+
+        # distances: axis points at native termini
+        "d_N_C_axis": d_N_C_axis,
+        "d_C_N_axis": d_C_N_axis,
+
+        # distances: axis points at extended cylinder endpoints
+        "d_N_C_ext_axis": d_N_C_ext_axis,
+        "d_C_N_ext_axis": d_C_N_ext_axis
+    }
 
 def canonical_id(pose1, model1, pose2, model2):
     a = (str(pose1).strip(), int(model1))
@@ -251,15 +360,15 @@ def main(args):
         for j, row2 in df2.iterrows():
             ent2 = pose2[row2['model_num']][row2['chain_id']]
             ent2_coords = [atom.coord for atom in ent2.get_atoms() if atom.id == "CA"]
-            overlap = extension_overlap_fraction(ent1_coords, ent2_coords, args.cylinder_height, radius1=args.radius, radius2=args.radius, xyz_surface_path=None)
-            results.append({
+            data = extension_overlap_fraction(ent1_coords, ent2_coords, args.cylinder_height, args.cylinder_height, radius1=args.radius, radius2=args.radius, xyz_surface_path=None)
+            data.update({
                 'pose1_path': row1['poses'],
                 'pose2_path': row2['poses'],
                 'model1': row1['model_num'],
                 'model2': row2['model_num'],
                 'id': canonical_id(row1['poses'], row1['model_num'], row2['poses'], row2['model_num']),
-                'overlap': overlap
             })
+            results.append(data)
 
     df_out = pd.DataFrame(results)    
     df_out.to_pickle(args.out)
