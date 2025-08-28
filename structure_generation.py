@@ -1040,7 +1040,7 @@ def main(args):
                 rosetta.run(
                     poses = backbones,
                     prefix = "bbopt",
-                    rosetta_application="rosetta_scripts.default.linuxgccrelease",
+                    rosetta_application=args.rosetta_application,
                     nstruct = 1,
                     options = bb_opt_options,
                     pose_options='screen_bbopt_opts'
@@ -1293,7 +1293,7 @@ def main(args):
             rosetta.run(
                 poses = backbones,
                 prefix = f"cycle_{cycle}_bbopt",
-                rosetta_application="rosetta_scripts.default.linuxgccrelease",
+                rosetta_application=args.rosetta_application,
                 nstruct = 1,
                 options = bb_opt_options,
                 pose_options=f'cycle_{cycle}_bbopt_opts'
@@ -1566,7 +1566,7 @@ def main(args):
         rosetta.run(
             poses = rlx_poses,
             prefix = "eval_af2_fastrelax",
-            rosetta_application="rosetta_scripts.default.linuxgccrelease",
+            rosetta_application=args.rosetta_application,
             nstruct = 15,
             options = fr_options
         )
@@ -1667,7 +1667,7 @@ def main(args):
         rosetta.run(
             poses = backbones,
             prefix = "variants_bbopt",
-            rosetta_application="rosetta_scripts.default.linuxgccrelease",
+            rosetta_application=args.rosetta_application,
             nstruct = 1,
             options = bb_opt_options,
             pose_options='variants_bbopt_opts'
@@ -1690,7 +1690,7 @@ def main(args):
                 rosetta.run(
                     poses=backbones,
                     prefix="coupled_moves",
-                    rosetta_application="rosetta_scripts.default.linuxgccrelease",
+                    rosetta_application=args.rosetta_application,
                     nstruct=50,
                     options=cm_options,
                     pose_options="cm_pose_opts")
@@ -1877,7 +1877,7 @@ def main(args):
         rosetta.run(
             poses = rlx_poses,
             prefix = "variants_af2_fastrelax",
-            rosetta_application="rosetta_scripts.default.linuxgccrelease",
+            rosetta_application=args.rosetta_application,
             nstruct = 15,
             options = fr_options
         )
@@ -1933,6 +1933,7 @@ if __name__ == "__main__":
     argparser.add_argument("--working_dir", type=str, required=True, help="output directory.")
 
     # general optionals
+    argparser.add_argument("--rosetta_application", type=str, default="rosetta_scripts.cxx11threadserialization.linuxclangrelease", help="Name of the Rosetta scripts applications (not the full path!)")
     argparser.add_argument("--skip_refinement", action="store_true", help="Skip refinement and evaluation, only run screening.")
     argparser.add_argument("--skip_evaluation", action="store_true", help="Skip evaluation, only run screening and refinement.")
     argparser.add_argument("--params_files", type=str, default=None, help="Path to alternative params file. Can also be multiple paths separated by ','.")

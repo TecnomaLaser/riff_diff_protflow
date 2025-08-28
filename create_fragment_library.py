@@ -1868,7 +1868,8 @@ def main(args):
             frag_pos_to_replace = define_rotamer_positions(res_args.rotamer_positions, res_args.fragsize)
 
             fraglib_path = os.path.join(database_dir, 'fraglib_noscore.pkl')
-            log_and_print(f"Importing fragment library from {fraglib_path}")
+            if not os.path.isfile(fraglib_path):
+                raise RuntimeError(f"Could not find fragment library at {fraglib_path}. Did you forget to download it?")
 
             rotlibs = []
 
