@@ -9,7 +9,6 @@ import time
 import math
 from collections import Counter
 
-
 # import dependencies
 import pandas as pd
 import numpy as np
@@ -1201,7 +1200,7 @@ def combine_normalized_scores(df: pd.DataFrame, name:str, scoreterms:list, weigh
     '''
     if not len(scoreterms) == len(weights):
         raise RuntimeError(f"Number of scoreterms ({len(scoreterms)}) and weights ({len(weights)}) must be equal!")
-    df[name] = sum([df[col]*weight for col, weight in zip(scoreterms, weights)]) / sum(weights)
+    df[name] = sum([df[col]*weight for col, weight in zip(scoreterms, weights)]) / sum([abs(weight) for weight in weights])
     if df[name].nunique() == 1:
         df[name] = 0
         return df
@@ -1798,6 +1797,50 @@ def build_frag_dict(rotlib, backbone_df):
 
     return frag_dict
 
+def run_overlap_extension_clash_detection(data:pd.DataFrame, directory:str, radius, cylinder_height, jobstarter, script_path):
+
+    def write_extension_overlap_cmd(script_path, fragments_a_path, fragments_b_path, radius, cylinder_height, out_path):
+        return f"{os.path.join(PROTFLOW_ENV, 'python')} {script_path} --frags1 {fragments_a_path} --frags2 {fragments_b_path} --radius {radius} --cylinder_height {cylinder_height} --out {out_path}"
+
+    def build_pair_ids(df, pose_col='poses', model_col='model_num'):
+        recs = []
+        for ens, g in df.groupby('ensemble_num', sort=False):
+            members = list(zip(g[pose_col], g[model_col]))
+            for a, b in itertools.combinations(members, 2):
+                lo, hi = (a, b) if a <= b else (b, a) # to canonicalize
+                recs.append({'ensemble_num': ens, 'id': (lo[0], lo[1], hi[0], hi[1])})
+        return pd.DataFrame(recs)
+    
+    fragments_paths = []
+    for pose, df in data.groupby("input_poses", sort=False):
+        df = df.drop_duplicates(subset=['model_num'])
+        df[["poses", "model_num", "chain_id"]].to_pickle(fragments_path := os.path.join(directory, f"{description_from_path(pose)}.pkl"))
+        fragments_paths.append(fragments_path)
+
+    out_paths = []
+    cmds = []
+    for i, set1 in enumerate(fragments_paths): # iterative over each set
+        for j in range(i+1, len(fragments_paths)):
+            set2 = fragments_paths[j]
+            out_paths.append(out_path := os.path.join(directory, f"{description_from_path(set1)}_{description_from_path(set2)}.pkl"))
+            cmds.append(write_extension_overlap_cmd(script_path, set1, set2, radius, cylinder_height, out_path))
+
+    jobstarter.start(cmds=cmds, jobname="overlap", output_path=directory)
+
+    results = []
+    for out_path in out_paths:
+        results.append(pd.read_pickle(out_path))
+
+    results = pd.concat(results)
+    id_df = build_pair_ids(data)
+
+
+    results = results.merge(id_df, on="id")
+    results = results[["ensemble_num", "overlap"]].groupby("ensemble_num", sort=False).sum(numeric_only=True)
+
+    results.to_csv("out2.csv")
+    return results
+
 
 def main(args):
     '''run'''
@@ -2178,20 +2221,33 @@ def main(args):
     log_and_print('Performing pairwise clash detection...')
     ensemble_dfs = run_clash_detection(data=combined, directory=clash_dir, bb_multiplier=args.frag_frag_bb_clash_vdw_multiplier, sc_multiplier=args.frag_frag_sc_clash_vdw_multiplier, script_path=os.path.join(utils_dir, "clash_detection.py"), jobstarter=jobstarter)
 
+    os.makedirs(overlap_clash_dir := os.path.join(working_dir, 'overlap_extension_clash_check'), exist_ok=True)
+
+    overlap_scores = run_overlap_extension_clash_detection(data=ensemble_dfs, directory=overlap_clash_dir, radius=3, cylinder_height=6, jobstarter=jobstarter, script_path=os.path.join(utils_dir, "overlap_extension_clash.py"))
+
     #calculate scores
     score_df = ensemble_dfs.groupby('ensemble_num', sort=False).mean(numeric_only=True)
-    score_df = normalize_col(score_df, 'fragment_score', scale=True, output_col_name='ensemble_score')
-    log_and_print(f'Found {len(score_df.index)} non-clashing ensembles.')
 
+    #score_df = normalize_col(score_df, 'fragment_score', scale=True, output_col_name='ensemble_score')
+
+    score_df = score_df.merge(overlap_scores, left_index=True, right_index=True)
+
+    score_df = normalize_col(score_df, 'fragment_score')
+    score_df = normalize_col(score_df, 'overlap')
+
+    score_df = combine_normalized_scores(score_df, 'ensemble_score', ['fragment_score_normalized', 'overlap_normalized'], [args.fragment_score_weight, args.overlap_weight], False, True)
+
+    log_and_print(f'Found {len(score_df.index)} non-clashing ensembles.')
+    log_and_print(score_df["ensemble_score"])
     plotpath = os.path.join(working_dir, "clash_filter.png")
     log_and_print(f"Plotting data at {plotpath}.")
     score_df_size = len(score_df.index)
     if score_df_size > 1000000:
         log_and_print(f"Downsampling dataframe for plotting because dataframe size is too big ({score_df_size} rows). Plotting only 1000000 random rows.")
         score_df_small = score_df.sample(n=1000000)
-        violinplot_multiple_cols(score_df_small, cols=['ensemble_score', 'backbone_probability', 'rotamer_probability', 'phi_psi_occurrence'], titles=['ensemble_score', 'mean backbone\nprobability', 'mean rotamer\nprobability', 'mean phi psi\noccurrence'], y_labels=['score', 'probability', 'probability', 'probability'], out_path=plotpath, show_fig=False)
+        violinplot_multiple_cols(score_df_small, cols=['ensemble_score', 'overlap', 'backbone_probability', 'rotamer_probability', 'phi_psi_occurrence'], titles=['ensemble_score', 'overlap', 'mean backbone\nprobability', 'mean rotamer\nprobability', 'mean phi psi\noccurrence'], y_labels=['score', 'mean relative overlaps', 'probability', 'probability', 'probability'], out_path=plotpath, show_fig=False)
     else:
-        violinplot_multiple_cols(score_df, cols=['ensemble_score', 'backbone_probability', 'rotamer_probability', 'phi_psi_occurrence'], titles=['ensemble_score', 'mean backbone\nprobability', 'mean rotamer\nprobability', 'mean phi psi\noccurrence'], y_labels=['score', 'probability', 'probability', 'probability'], out_path=plotpath, show_fig=False)
+        violinplot_multiple_cols(score_df, cols=['ensemble_score', 'overlap', 'backbone_probability', 'rotamer_probability', 'phi_psi_occurrence'], titles=['ensemble_score', 'overlap', 'mean backbone\nprobability', 'mean rotamer\nprobability', 'mean phi psi\noccurrence'], y_labels=['score', 'mean relative overlaps', 'probability', 'probability', 'probability'], out_path=plotpath, show_fig=False)
 
     # pre-filtering to reduce df size
     score_df_top = score_df.nlargest(args.max_top_out, 'ensemble_score')
@@ -2209,9 +2265,9 @@ def main(args):
 
     plotpath = os.path.join(working_dir, "pre_filter.png")
     log_and_print(f"Plotting selected ensemble results at {plotpath}.")
-    violinplot_multiple_cols(score_df, cols=['ensemble_score', 'backbone_probability', 'rotamer_probability', 'phi_psi_occurrence'], titles=['ensemble_score', 'mean backbone\nprobability', 'mean rotamer\nprobability', 'mean phi psi\noccurrence'], y_labels=['score', 'probability', 'probability', 'probability'], out_path=plotpath, show_fig=False)
+    violinplot_multiple_cols(score_df, cols=['ensemble_score', 'overlap', 'backbone_probability', 'rotamer_probability', 'phi_psi_occurrence'], titles=['ensemble_score', 'overlap', 'mean backbone\nprobability', 'mean rotamer\nprobability', 'mean phi psi\noccurrence'], y_labels=['score', 'mean relative overlaps', 'probability', 'probability', 'probability'], out_path=plotpath, show_fig=False)
 
-    post_clash = ensemble_dfs.merge(score_df['ensemble_score'], left_on='ensemble_num', right_index=True).sort_values('ensemble_num').reset_index(drop=True)
+    post_clash = ensemble_dfs.merge(score_df[['ensemble_score', 'overlap']], left_on='ensemble_num', right_index=True).sort_values('ensemble_num').reset_index(drop=True)
 
     log_and_print(f'Completed clash check in {round(time.time() - init, 0)} s.')
     if len(post_clash.index) == 0:
@@ -2282,12 +2338,13 @@ def main(args):
                  'backbone_probability': [("backbone_probability", concat_columns), ("backbone_probability_mean", "mean")],
                  'rotamer_probability': [("rotamer_probability", concat_columns), ("rotamer_probability_mean", "mean")],
                  'phi_psi_occurrence': [("phi_psi_occurrence", concat_columns), ("phi_psi_occurrence_mean", "mean")],
-                 'covalent_bonds': concat_columns}
+                 'covalent_bonds': concat_columns,
+                 'overlap': 'mean'}
 
     selected_paths = selected_paths.groupby('path_name', sort=False).agg(aggregate).reset_index(names=["path_name"])
     selected_paths.columns = ['path_name', 'poses', 'chain_id', 'model_num', 'rotamer_pos', 'frag_length',
                                'path_score', 'backbone_probability', 'backbone_probability_mean', 'rotamer_probability',
-                               'rotamer_probability_mean','phi_psi_occurrence', 'phi_psi_occurrence_mean', 'covalent_bonds']
+                               'rotamer_probability_mean','phi_psi_occurrence', 'phi_psi_occurrence_mean', 'covalent_bonds', 'overlap']
 
     # create residue selections
     selected_paths["fixed_residues"] = selected_paths.apply(lambda row: split_str_to_dict(row['chain_id'], row['rotamer_pos'], sep=","), axis=1)
@@ -2342,7 +2399,7 @@ def main(args):
     # write output json
     selected_paths.to_json(out_json)
 
-    violinplot_multiple_cols(selected_paths, cols=['backbone_probability_mean', 'phi_psi_occurrence_mean', 'rotamer_probability_mean'], titles=['mean backbone\nprobability', 'mean phi/psi\nprobability', 'mean rotamer\nprobability'], y_labels=['probability', 'probability', 'probability'], out_path=os.path.join(working_dir, "selected_paths_info.png"), show_fig=False)
+    violinplot_multiple_cols(selected_paths, cols=['overlap', 'backbone_probability_mean', 'phi_psi_occurrence_mean', 'rotamer_probability_mean'], titles=['overlap', 'mean backbone\nprobability', 'mean phi/psi\nprobability', 'mean rotamer\nprobability'], y_labels=['relative\ncylinder overlap', 'probability', 'probability', 'probability'], out_path=os.path.join(working_dir, "selected_paths_info.png"), show_fig=False)
 
     log_and_print('Done!')
 
@@ -2400,13 +2457,13 @@ if __name__ == "__main__":
     argparser.add_argument("--backbone_score_weight", type=float, default=1, help="Weight for importance of fragment backbone score (boltzman score of number of occurrences of similar fragments in the database) when sorting fragments.")
     argparser.add_argument("--rotamer_score_weight", type=float, default=1, help="Weight for importance of rotamer score (combined score of probability and occurrence) when sorting fragments.")
     argparser.add_argument("--chi_std_multiplier", type=float, default=2, help="Multiplier for chi angle standard deviation to check if rotamer in database fits to desired rotamer.")
-
+    argparser.add_argument("--fragment_score_weight", type=float, default=1, help="Weight for importance of fragment score.")
+    argparser.add_argument("--overlap_weight", type=float, default=-1, help="Weight for importance of cylindrical overlap.")
 
     # stuff you might want to adjust
     argparser.add_argument("--max_paths_per_ensemble", type=int, default=4, help="Maximum number of paths per ensemble (=same fragments but in different order)")
     argparser.add_argument("--frag_frag_bb_clash_vdw_multiplier", type=float, default=0.9, help="Multiplier for VanderWaals radii for clash detection inbetween backbone fragments. Clash is detected if distance_between_atoms < (VdW_radius_atom1 + VdW_radius_atom2)*multiplier.")
     argparser.add_argument("--frag_frag_sc_clash_vdw_multiplier", type=float, default=0.8, help="Multiplier for VanderWaals radii for clash detection between fragment sidechains and backbones. Clash is detected if distance_between_atoms < (VdW_radius_atom1 + VdW_radius_atom2)*multiplier.")
-    argparser.add_argument("--fragment_score_weight", type=float, default=1, help="Maximum number of cpus to run on")
     argparser.add_argument("--max_top_out", type=int, default=100, help="Maximum number of top-ranked output paths")
     argparser.add_argument("--max_random_out", type=int, default=100, help="Maximum number of random-ranked output paths")
 
