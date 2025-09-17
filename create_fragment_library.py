@@ -307,16 +307,12 @@ def filter_frags_df_by_secondary_structure_content(frags_df, frag_sec_struct_fra
     '''
     filter fragment dataframe to specified fraction of secondary structure content
     '''
-    frags_df_list = []
-    for _, df in frags_df.groupby('frag_num', sort=False):
-        for sec_struct, fraction in frag_sec_struct_fraction.items():
-            if df['ss'].str.contains(sec_struct, regex=False).sum() / len(df.index) >= fraction:
-                frags_df_list.append(df)
-                break
-    if len(frags_df_list) > 0:
-        frags_df = pd.concat(frags_df_list)
-        return frags_df
-    return pd.DataFrame()
+    for sec_struct, fraction in frag_sec_struct_fraction.items():
+        frags_df = frags_df[frags_df[f"{sec_struct}_content"] >= fraction]
+    if frags_df.empty:
+        raise RuntimeError(f"Could not find any fragments that pass secondary structure critera: {frag_sec_struct_fraction}")
+    frags_df.reset_index(drop=True, inplace=True)
+    return frags_df
 
 def filter_frags_df_by_score(frags_df, score_cutoff, scoretype, mode):
     '''
@@ -445,63 +441,24 @@ def sort_frags_df_by_score(frags_df, backbone_score_weight, rotamer_score_weight
     # calculate number of fragments
     total_fragments = frags_df['frag_num'].nunique()
 
-    # correct angles for better median calculations
-    for col in ['phi', 'psi', 'omega']:
-        frags_df.loc[frags_df[col] <= -175, col] += 360
-
-    cols = frags_df.columns
-    AA_i     = cols.get_loc('AA')
-    phi_i    = cols.get_loc('phi')
-    psi_i    = cols.get_loc('psi')
-    omega_i  = cols.get_loc('omega')
-    frag_i   = cols.get_loc('frag_num')
-    rotpos_i = cols.get_loc('rotamer_pos')
-    rotid_i  = cols.get_loc('rotamer_id')
-
-    df_list = []
-    frag_num = 0
     # assume frag_num is defined before the loop
-    for _, unique_df in frags_df.groupby('frag_identifier', sort=False):
-        # read rotamer info
-        rotamer_pos = int(unique_df.iat[0, rotpos_i])
-        rotamer_id  = unique_df.iat[0, rotid_i]
 
-        # backbone count (fast path if guaranteed layout: len(unique_df)//frag_length)
-        backbone_count = len(unique_df)//frag_length
+    # assign backbone count
+    log_and_print("Assigning backbone count")
+    frags_df['backbone_count'] = frags_df.groupby('bb_identifier', sort=False)['bb_identifier'].transform('size') / frag_length
 
-        # compute medians for each residue position
-        # (your existing lists phis/psis/omegas work; vectorized shown here)
-        n = len(unique_df)
-        bc = n // frag_length
+    # remove all duplicate backbones
+    log_and_print("Dropping duplicates...")
+    unique = frags_df.drop_duplicates(["frag_identifier"], keep="first")
+    unique['backbone_probability'] = unique['backbone_count'] / total_fragments
+    log_and_print(f"Found {len(unique.index)} unique fragments")
 
-        phi_v   = unique_df.iloc[:, phi_i].to_numpy()
-        psi_v   = unique_df.iloc[:, psi_i].to_numpy()
-        omega_v = unique_df.iloc[:, omega_i].to_numpy()
+    # merge back to full data
+    frags_df = frags_df.merge(unique[['frag_num', 'backbone_probability']], on="frag_num", how="inner")
 
-        phis   = np.nanmedian(phi_v.reshape(frag_length, bc),   axis=1)
-        psis   = np.nanmedian(psi_v.reshape(frag_length, bc),   axis=1)
-        omegas = np.nanmedian(omega_v.reshape(frag_length, bc), axis=1)
-
-        head = slice(0, frag_length)
-
-        # set AA for the first fragment
-        unique_df.iloc[head, AA_i] = 'GLY'
-        unique_df.iat[rotamer_pos - 1, AA_i] = rotamer_id  # still OK (scalar)
-
-        # write medians only into the first fragment rows
-        unique_df.iloc[head, [phi_i, psi_i, omega_i]] = np.column_stack((phis, psis, omegas))
-
-        # and only tag those rows
-        unique_df.iloc[head, frag_i] = frag_num
-        unique_df.loc[unique_df.index[head], 'backbone_count'] = backbone_count
-
-        df_list.append(unique_df.iloc[head])
-        frag_num += 1
-
-    frags_df = pd.concat(df_list, ignore_index=True)
-
-    frags_df.drop(['pdb', 'ss', 'frag_identifier'], axis=1, inplace=True)
-    frags_df['backbone_probability'] = frags_df['backbone_count'] / total_fragments
+    frags_df.drop(['pdb', 'ss', 'frag_identifier', 'bb_identifier'], axis=1, inplace=True)
+    for angle in ['phi', 'psi', 'omega']:
+        frags_df[angle] = frags_df[f"{angle}_rounded"]
 
     #sort frags by fragment score
     grouped = frags_df[['frag_num', 'backbone_probability', 'rotamer_score']].groupby('frag_num', sort=False).mean(numeric_only=True)
@@ -723,7 +680,6 @@ def extract_fragments(rotamer_positions_df: pd.DataFrame, fraglib_path: str, fra
         return cmd
 
     #choose fragments from fragment library that contain the positions selected above
-    frag_dict = {}
     rotamer_positions_df["temp_index_for_merge"] = rotamer_positions_df.index
 
     os.makedirs(working_dir, exist_ok=True)
@@ -2025,6 +1981,7 @@ def main(args):
 
                     flipped_frag = align_to_sidechain(flipped_frag, frag[pos], theozyme_residue, True)
                     flipped_df["flipped"] = True
+                    print("check")
                     check_dict = check_fragment(
                         frag=flipped_frag,
                         check_dict=check_dict,
