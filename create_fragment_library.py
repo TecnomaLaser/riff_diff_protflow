@@ -449,7 +449,7 @@ def sort_frags_df_by_score(frags_df, backbone_score_weight, rotamer_score_weight
 
     # remove all duplicate backbones
     log_and_print("Dropping duplicates...")
-    unique = frags_df.drop_duplicates(["frag_identifier"], keep="first")
+    unique = frags_df.drop_duplicates(["frag_identifier"], keep="first").copy()
     unique['backbone_probability'] = unique['backbone_count'] / total_fragments
     log_and_print(f"Found {len(unique.index)} unique fragments")
 
@@ -1981,7 +1981,6 @@ def main(args):
 
                     flipped_frag = align_to_sidechain(flipped_frag, frag[pos], theozyme_residue, True)
                     flipped_df["flipped"] = True
-                    print("check")
                     check_dict = check_fragment(
                         frag=flipped_frag,
                         check_dict=check_dict,
