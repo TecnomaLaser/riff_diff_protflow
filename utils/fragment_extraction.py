@@ -23,18 +23,40 @@ def assign_frag_identifier(df, pos):
         df[f"{angle}_rounded"] = df[angle].round(-1).replace(-180, 180).astype(int)
 
     # Function to create the identifier for each frag_num group
-    def make_identifier(group):
+    def make_bb_identifier(group):
         dihedral_seq = tuple(zip(group['phi_rounded'], group['psi_rounded'], group['omega_rounded']))  # preserve order
-        rotamer = group['rotamer_index'].iloc[0]
+        return dihedral_seq
+
+    # Function to create the identifier for each frag_num group
+    def make_frag_identifier(group):
+        dihedral_seq = tuple(zip(group['phi_rounded'], group['psi_rounded'], group['omega_rounded']))  # preserve order
+        rotamer = int(group['rotamer_index'].iloc[0])
         return (dihedral_seq, rotamer, pos)
 
     # Apply group-wise identifier creation
-    identifiers = df.groupby('frag_num', sort=False).apply(make_identifier)
-    identifiers.name = 'frag_identifier'
-    identifiers = identifiers.reset_index()
+    grouped = df.groupby('frag_num', sort=False)
+
+    # create backbone ids
+    bb_ids = grouped.apply(make_bb_identifier)
+    bb_ids.name = 'bb_identifier'
+    bb_ids = bb_ids.reset_index()
+
+    # create frag ids
+    frag_ids = grouped.apply(make_frag_identifier)
+    frag_ids.name = 'frag_identifier'
+    frag_ids = frag_ids.reset_index()
 
     # Merge the identifier back to the full DataFrame
-    df = df.merge(identifiers, on='frag_num', how='left')
+    df = df.merge(bb_ids, on='frag_num', how='left')
+    df = df.merge(frag_ids, on='frag_num', how='left')
+
+    # Calculate secondary structure content
+    sec_structs = ["B", "E", "G", "H", "I", "T", "S", "-"]
+    fracs = (pd.crosstab(df['frag_num'], df['ss'], normalize='index')
+               .reindex(columns=sec_structs, fill_value=0.0)
+               .add_suffix('_content')
+               .reset_index())
+    df = df.merge(fracs, on='frag_num', how='left')
 
     return df
 
@@ -51,6 +73,7 @@ def main(args):
 
     rotamer_positions_df = pd.read_pickle(args.rotpos_path)
     fraglib = pd.read_pickle(args.fraglib_path)
+    fraglib.drop([col for col in fraglib.columns if col.startswith("chi")], inplace=True, axis=1)
 
     #choose fragments from fragment library that contain the positions selected above
     fragnum = 0
@@ -97,7 +120,8 @@ def main(args):
 
         # merge with rotamer_positions df on index column and correct position (to make sure not merging with rotamer at another position!)
         valid_groups_merge = valid_groups.copy()
-        preserve_cols = ['temp_index_for_merge', 'temp_pos_for_merge', 'AA', 'probability', 'phi_psi_occurrence', 'rotamer_score', 'rotamer_index']
+        chi_angles = [col for col in rotamer_positions_df.columns if col.startswith("chi")]
+        preserve_cols = ['temp_index_for_merge', 'temp_pos_for_merge', 'AA', 'probability', 'phi_psi_occurrence', 'rotamer_score', 'rotamer_index'] + chi_angles
         valid_groups_merge = valid_groups_merge[['temp_index_for_merge', 'residue_numbers', 'frag_num']].merge(rotamer_positions_df[preserve_cols], left_on=['temp_index_for_merge', 'residue_numbers'], right_on=['temp_index_for_merge', 'temp_pos_for_merge'])
 
         # modify df for downstream processing
@@ -108,9 +132,11 @@ def main(args):
         # merge back with all residues from fragments
         frags_df = valid_groups.merge(valid_groups_merge, on="frag_num")
 
-        # set non-rotamer positions to 0
-        frags_df.loc[frags_df['residue_numbers'] != pos, 'probability'] = None
-        frags_df.loc[frags_df['residue_numbers'] != pos, 'phi_psi_occurrence'] = None
+        # set non-rotamer positions
+        mask = frags_df['residue_numbers'].ne(pos)  # rows to change
+        frags_df.loc[mask, ['probability', 'phi_psi_occurrence', 'AA']] = [None, None, 'GLY']
+        for chi_angle in [col for col in frags_df.columns if col.startswith("chi")]:
+            frags_df.loc[mask, chi_angle] = None
 
         # define rotamer position
         frags_df['rotamer_pos'] = pos
